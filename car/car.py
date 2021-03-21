@@ -1,4 +1,4 @@
-from typing import Tuple, Any
+from typing import Tuple, List
 
 import numpy as np
 
@@ -7,6 +7,8 @@ from track import Track
 
 
 class Car:
+    vehicle_sensor_angles = [90, 30, 15, 10, 5, 0, -5, -10, -15, -30, -90]
+
     def __init__(self, index: int, network: Network, track: Track):
         self.car_index = index
         self.network: Network = network
@@ -21,18 +23,20 @@ class Car:
         self.__local_velocity = np.array([0.0, 0.0])  # (y, x) +x is forwards
         self.__local_acceleration = np.array([0.0, 0.0])  # (y, x) +x is forwards
         self.has_crashed = False
+        self.best_angle = 0
 
         # Vehicle parameters
-        self.max_steering_angle = np.radians(30)
+        self.max_steering_angle = np.radians(40)
         self.max_acceleration = 2 * 9.81
         self.max_deceleration = 5.5 * 9.81
-        self.Cdrag = 1.2
-        self.Crr = 30 * 1.2  # rolling resistance
+        self.Cdrag = 1.25
+        self.Crr = 30 * self.Cdrag  # rolling resistance
+        self.mass = 740
+        self.wheel_base = 3.698  # Mercedes wheelbase
+        self.num_standstill = 0
 
         # Unused for now
-        self.mass = 740
         self.tyre_friction = -0.0150
-        self.wheel_base = 3.698  # Mercedes wheelbase
 
     def update(self, time_delta: float):
         """Perform a simulation step"""
@@ -49,8 +53,11 @@ class Car:
         steering_angle, gas_pedal = self.network.get_output()
 
         # Calculate the steering angle and new heading
-        steering_angle *= self.max_steering_angle * np.exp(-self.speed/25)
-        self.heading += steering_angle * time_delta * self.speed
+        steering_angle *= self.max_steering_angle * np.exp(-(self.speed/40)**2)
+
+        turn_radius = self.wheel_base / (2 * np.sin(0.5 * steering_angle))
+        heading_change = (self.speed * time_delta) / turn_radius
+        self.heading += heading_change
 
         # Keep heading inside [0, 2pi]
         if self.heading >= 2 * np.pi:
@@ -65,8 +72,8 @@ class Car:
             self.__local_acceleration = np.array([0, self.max_deceleration * gas_pedal])
 
         # Drag and rolling resistance
-        # self.acceleration -= self.Cdrag * self.heading_vector * self.speed ** 2
-        # self.acceleration -= self.Crr * self.heading_vector * self.speed
+        self.__local_acceleration -= (self.Cdrag * self.__local_velocity * self.speed) / self.mass
+        self.__local_acceleration -= (self.Crr * self.__local_velocity) / self.mass
 
         # Update position
         self.__local_velocity += self.__local_acceleration * time_delta
@@ -81,23 +88,50 @@ class Car:
 
         # Check if we crashed
         if self.track.is_outside(self.position):
-            # print(f"Car crashed at {self.total_time}")
             self.has_crashed = True
 
+        # Don't continue simulation if the car is standing still
+        if self.total_time > 5:
+            avg_speed = self.distance_travelled / self.total_time
+            if avg_speed < 10:
+                self.has_crashed = True
+            if self.speed < 1:
+                self.num_standstill += 1
+                if self.num_standstill > 30:
+                    self.has_crashed = True
+        if self.total_time == 5:
+            progress = self.track.get_lap_progress(self.position)
+            if progress > 0.5:
+                progress -= 1
+            progress *= self.track.track_length_m
+            if progress < 20:
+                self.has_crashed = True
+
     def calculate_fitness(self):
-        self.distance_finished = self.track.get_lap_progress(self.position)  # [0, 1]
-        lap_distance = self.distance_finished * self.track.track_length_m
-        if self.distance_travelled < 0.5 * lap_distance and self.distance_finished > 0.4:
-            # We went backwards
-            self.distance_finished *= -1
+        score = self.distance_travelled
 
-        avg_speed = (self.distance_travelled / self.total_time)
-        avg_speed_ratio = avg_speed / 100  # 100 m/s is about the max speed
+        # Calculate wrong heading penalty
+        index = self.track.get_closest_green_line_index(self.position)
+        behind, ahead = self.track.green_line[index - 2], self.track.green_line[index + 2]
+        dy, dx = behind[0] - ahead[0], ahead[1] - behind[1]
+        angle = -np.arctan2(dy, dx)
+        heading = self.heading
+        if heading > np.pi:
+            heading -= 2 * np.pi
+        diff = angle - heading
+        diff -= 2 * np.pi if diff > np.pi else 0
+        diff += 2 * np.pi if diff < -np.pi else 0
+        diff = abs(diff)
+        score -= diff * 10
 
-        distance_weight = 10
-        speed_weight = 2
+        # Calculate hard crash penalty
+        if self.has_crashed:
+            penalty = self.speed ** 2 / 150
+            score -= penalty
 
-        self.network.fitness = distance_weight * self.distance_finished + speed_weight * avg_speed_ratio
+        self.network.fitness = score
+
+        return
 
     @property
     def forward_unit_vector(self):
@@ -121,24 +155,39 @@ class Car:
         c, s = np.cos(theta), np.sin(theta)
         return np.array(((c, s), (-s, c)))
 
-    def generate_network_input(self) -> Tuple[Any, float]:
-        return *self.get_sensor_input(), self.speed
+    def generate_network_input(self) -> Tuple[float, ...]:
+        sensor_input = self.get_sensor_input()
+        left = sensor_input[0]
+        right = sensor_input[-1]
 
-    def get_free_distance(self, unit_vector):
-        max_dist = 50
-        for dist in range(1, max_dist, 1):
+        angles = self.vehicle_sensor_angles[1:-1]
+        values = sensor_input[1:-1]
+        avg = sum(values) / len(values)
+
+        tot = 0
+        for val, ang in zip(values, angles):
+            tot += ang * val
+        self.best_angle = tot/sum(values) / 30
+        max_dist = max(values)
+        return left/10, right/10, self.best_angle, max_dist/250, self.speed/80
+
+    def get_free_distance(self, unit_vector) -> float:
+        max_dist = 250
+        dist_coarse = max_dist
+        for dist in range(10, max_dist+1, 10):
+            pos = self.position + unit_vector * dist
+            if self.track.is_outside(pos):
+                dist_coarse = dist
+                break
+            elif dist == max_dist:
+                # If the last is also free, no need to finetune
+                return max_dist
+
+        for dist in range(dist_coarse - 10, dist_coarse+1, 1):
             pos = self.position + unit_vector * dist
             if self.track.is_outside(pos):
                 return dist
         return max_dist
 
-    def get_sensor_input(self) -> Tuple[int, int, int, int, int]:
-        left = self.get_free_distance(self.left_unit_vector)
-        left_forward = self.get_free_distance(self.unit_vector_rotated(np.deg2rad(-20)))
-        forward = self.get_free_distance(self.forward_unit_vector)
-        right_forward = self.get_free_distance(self.unit_vector_rotated(np.deg2rad(20)))
-        right = self.get_free_distance(-self.left_unit_vector)
-
-        return left, left_forward, forward, right_forward, right
-
-
+    def get_sensor_input(self) -> List[float]:
+        return [self.get_free_distance(self.unit_vector_rotated(np.deg2rad(i))) for i in self.vehicle_sensor_angles]

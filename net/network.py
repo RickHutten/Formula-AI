@@ -21,7 +21,9 @@ class Network:
         output of the last layer.
         """
         # Check the input data is the right size
-        assert len(input_data) == self.layer_structure[0]
+        assert len(input_data) == self.layer_structure[0], \
+            f'input data length is not equal to the number of nodes in the first layer: ' \
+            f'{len(input_data)} and {self.layer_structure[0]}'
 
         # Pass data through the network
         for layer_index, layer in enumerate(self.layers):

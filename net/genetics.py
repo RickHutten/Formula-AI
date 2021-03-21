@@ -1,5 +1,6 @@
 from typing import List, Optional
 from random import randint, random, uniform, choices
+import json
 
 import numpy as np
 
@@ -9,7 +10,7 @@ DNA = List[float]
 
 
 class GeneticController:
-    def __init__(self, population_size: int, mutation_rate: float):
+    def __init__(self, population_size: int, mutation_rate: float, layer_structure: List[int]):
         self.population_size = population_size
         self.mutation_rate = mutation_rate
         self.average_fitness = 0.0
@@ -18,15 +19,15 @@ class GeneticController:
         self.generation_index = 0
 
         # Create a population
-        layer_structure = [6, 10, 5, 2]
-        self.population = [Network(layer_structure) for _ in range(population_size)]
+        self.layer_structure = layer_structure
+        self.population = [Network(self.layer_structure) for _ in range(population_size)]
 
     def __make_baby(self, mother: Network, father: Network) -> Network:
         baby: Chromosome = Chromosome(self.mutation_rate, mother) * Chromosome(self.mutation_rate, father)
         return baby.network
 
     def __parent_choice_weight(self):
-        return [10 ** -x for x in np.linspace(0, 1, self.population_size)]
+        return [(40 ** -x) - 1/40 for x in np.linspace(0, 1, self.population_size)]
 
     def next_generation(self):
         print(f"Generation {self.generation_index}:")
@@ -41,8 +42,8 @@ class GeneticController:
         print(f"\tAverage fitness: {self.average_fitness}")
         print(f"\tBest fitness: {[veh.fitness for veh in self.population][:3]}")
 
-        # Save the best 3 so far
-        new_population: List[Network] = self.population[:3]
+        # Save the best so far
+        new_population: List[Network] = self.population[:1]
 
         while len(new_population) < self.population_size:
             mother, father = choices(list(range(len(self.population))), weights=self.__parent_choice_weight(), k=2)
@@ -56,6 +57,44 @@ class GeneticController:
         # Babies grow old
         self.population = new_population
         self.generation_index += 1
+
+    def save(self, filename):
+        """Save the population to a json file"""
+        if filename[-5:] != ".json":
+            filename += ".json"
+
+        print("Saving to", filename)
+        data = {
+            'init': {
+                "population_size": self.population_size,
+                'mutation_rate': self.mutation_rate,
+                'layer_structure': self.layer_structure,
+            },
+            'generation_index': self.generation_index,
+            'population': [
+                Chromosome(self.mutation_rate, entity).dna for i, entity in enumerate(self.population)
+            ],
+        }
+        with open(filename, 'w') as f:
+            f.write(json.dumps(data, indent=4))
+
+    @staticmethod
+    def load(filename):
+        """Loads a json file to restore the genetic controller"""
+        with open(filename, 'r') as f:
+            data = json.load(f)
+
+        # Init the GeneticController
+        gc = GeneticController(**data['init'])
+        gc.generation_index = data['generation_index']
+
+        # Set the weights of the networks inside the controller
+        for i in range(gc.population_size):
+            dna = data['population'][i]
+            network_dummy = Network(gc.layer_structure)
+            chromosome = Chromosome(gc.mutation_rate, network_dummy, dna)
+            gc.population[i] = chromosome.network
+        return gc
 
 
 class Chromosome:
@@ -122,6 +161,9 @@ class Chromosome:
         for i in range(len(self.dna)):
             if random() < self.mutation_rate:
                 self.dna[i] = uniform(-1.0, 1.0)
+            elif random() < 2 * self.mutation_rate:
+                self.dna[i] *= uniform(0.9, 1.1)
+                self.dna[i] = min(max(self.dna[i], -1), 1)
         # Rebuild network
         self.__update_network()
 
