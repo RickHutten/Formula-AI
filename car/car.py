@@ -1,4 +1,4 @@
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 
 import numpy as np
 
@@ -23,10 +23,9 @@ class Car:
         self.__local_velocity = np.array([0.0, 0.0])  # (y, x) +x is forwards
         self.__local_acceleration = np.array([0.0, 0.0])  # (y, x) +x is forwards
         self.has_crashed = False
-        self.best_angle = 0
 
         # Vehicle parameters
-        self.max_steering_angle = np.radians(40)
+        self.max_steering_angle = np.radians(30)
         self.max_acceleration = 2 * 9.81
         self.max_deceleration = 5.5 * 9.81
         self.Cdrag = 1.25
@@ -52,6 +51,9 @@ class Car:
         # Get the output
         steering_angle, gas_pedal = self.network.get_output()
 
+        self.propagate(time_delta, steering_angle, gas_pedal)
+
+    def propagate(self, time_delta: float, steering_angle: float, gas_pedal: float):
         # Calculate the steering angle and new heading
         steering_angle *= self.max_steering_angle * np.exp(-(self.speed/40)**2)
 
@@ -111,27 +113,33 @@ class Car:
         score = self.distance_travelled
 
         # Calculate wrong heading penalty
-        index = self.track.get_closest_green_line_index(self.position)
-        behind, ahead = self.track.green_line[index - 2], self.track.green_line[index + 2]
-        dy, dx = behind[0] - ahead[0], ahead[1] - behind[1]
-        angle = -np.arctan2(dy, dx)
+        diff = abs(self.get_track_car_heading_difference())
+        score -= diff * 10
+
+        # Calculate hard crash penalty
+        if self.has_crashed:
+            penalty = self.speed ** 2 / 150 * diff
+            score -= penalty
+
+        # if self.car_index == 0:
+        #     print(f"{diff=}\n"
+        #           f"{self.speed ** 2 / 150=}\n"
+        #           f"{penalty=}")
+
+        self.network.fitness = score
+        return
+
+    def get_track_car_heading_difference(self, green_line_index: Optional[int] = None):
+        if green_line_index is None:
+            green_line_index = self.track.get_closest_green_line_index(self.position)
+        angle = self.track_heading(green_line_index)
         heading = self.heading
         if heading > np.pi:
             heading -= 2 * np.pi
         diff = angle - heading
         diff -= 2 * np.pi if diff > np.pi else 0
         diff += 2 * np.pi if diff < -np.pi else 0
-        diff = abs(diff)
-        score -= diff * 10
-
-        # Calculate hard crash penalty
-        if self.has_crashed:
-            penalty = self.speed ** 2 / 150
-            score -= penalty
-
-        self.network.fitness = score
-
-        return
+        return diff
 
     @property
     def forward_unit_vector(self):
@@ -143,6 +151,41 @@ class Car:
 
     def unit_vector_rotated(self, rot):
         return np.array([np.sin(self.heading - rot), np.cos(self.heading - rot)])
+
+    def track_unit_vector(self, green_line_index: Optional[int] = None):
+        heading = self.track_heading(green_line_index)
+        return np.array([np.sin(heading), np.cos(heading)])
+
+    def track_heading(self, green_line_index: Optional[int] = None):
+        if green_line_index is None:
+            green_line_index = self.track.get_closest_green_line_index(self.position)
+
+        behind = self.track.green_line[green_line_index-10]
+        ahead = self.track.green_line[(green_line_index+10) % len(self.track.green_line)]
+        dy, dx = behind[0] - ahead[0], ahead[1] - behind[1]
+        angle = -np.arctan2(dy, dx)
+        return angle  # [-pi, pi]
+
+    def get_green_line_ahead(self, distance, index: Optional[int] = None):
+        if index is None:
+            index = self.track.get_closest_green_line_index(self.position)
+        pixels = int(distance / self.track.scale)
+        return self.track.green_line[(index + pixels) % len(self.track.green_line)]
+
+    def get_closest_green_line_position(self):
+        index = self.track.get_closest_green_line_index(self.position)
+        return self.track.green_line[index]
+
+    def get_track_ahead(self, distance, index: Optional[int] = None):
+        if index is None:
+            index = self.track.get_closest_green_line_index(self.position)
+        vector = self.track_unit_vector(index)
+        y, x = self.track.green_line[index] + vector * distance / self.track.scale
+        return int(y), int(x)
+
+    def get_forward(self, distance):
+        y, x = self.track.vehicle_pos_to_px(self.position) + self.forward_unit_vector * distance / self.track.scale
+        return int(y), int(x)
 
     @property
     def speed(self) -> float:
@@ -156,20 +199,35 @@ class Car:
         return np.array(((c, s), (-s, c)))
 
     def generate_network_input(self) -> Tuple[float, ...]:
-        sensor_input = self.get_sensor_input()
-        left = sensor_input[0]
-        right = sensor_input[-1]
+        index = self.track.get_closest_green_line_index(self.position)
+        pos_y, pos_x = self.track.vehicle_pos_to_px(self.position)
+        y, x = self.track.green_line[index]
+        dist_px = np.hypot(y - pos_y, x - pos_x)
+        distance = dist_px * self.track.scale
+        y2, x2 = self.track.green_line[index - 1]
 
-        angles = self.vehicle_sensor_angles[1:-1]
-        values = sensor_input[1:-1]
-        avg = sum(values) / len(values)
+        def is_left(ax, ay, bx, by, cx, cy):
+            return ((bx - ax) * (cy - ay) - (by - ay) * (cx - ax)) > 0
 
-        tot = 0
-        for val, ang in zip(values, angles):
-            tot += ang * val
-        self.best_angle = tot/sum(values) / 30
-        max_dist = max(values)
-        return left/10, right/10, self.best_angle, max_dist/250, self.speed/80
+        def area_triangle(ax, ay, bx, by, cx, cy):
+            area = (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by)) / 2
+            return area
+
+        def get_area_track(dist):
+            y1, x1 = self.get_green_line_ahead(10, index)
+            y2, x2 = self.get_green_line_ahead(-10, index)
+            pos_y, pos_x = self.get_green_line_ahead(dist, index)
+            area = area_triangle(x2, y2, x1, y1, pos_x, pos_y)
+            return area * self.track.scale * self.track.scale / (10 * dist)
+
+        if is_left(x2, y2, x, y, pos_x, pos_y):
+            distance = -distance  # Distance to center line
+
+        diff = self.get_track_car_heading_difference(index)
+
+        input = self.speed/60, distance/10, diff, get_area_track(20), get_area_track(50), get_area_track(100), get_area_track(200)
+
+        return input
 
     def get_free_distance(self, unit_vector) -> float:
         max_dist = 250

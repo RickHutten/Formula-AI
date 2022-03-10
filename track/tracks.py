@@ -16,9 +16,12 @@ class Track:
 
         self.grids = np.array(list(zip(*np.where(np.all(self.image == (255, 0, 0), axis=-1)))))
         self.start = np.array(list(zip(*np.where(np.all(self.image == (0, 255, 255), axis=-1))))[0])
+        self.finish = np.array(list(zip(*np.where(np.all(self.image == (0, 0, 255), axis=-1)))))
+        self.finish = np.append(self.start, self.finish)
 
         self.green_line, self.track_length_px = self.__compute_green_line()
         self.scale = self.track_length_m / self.track_length_px  # meter per pixel
+        self.track_width = len(self.finish) * self.scale
 
     def is_outside(self, position: np.array) -> bool:
         """Returns whether the position is outside the track"""
@@ -39,21 +42,29 @@ class Track:
         min_pos = ()
 
         i = 0
-        step = 1
+        loops = 0
+        max_dist = self.track_width / 1.5  # The maximum we can be away from the green line (but not really)
         while i < len(self.green_line):
+            loops += 1
             y, x = self.green_line[i]
-            dist_sq = (y - position[0])**2 + (x - position[1])**2
+            dist_px = np.hypot(y - position[0], x - position[1])
+            dist_m = dist_px * self.scale
 
-            if dist_sq > 1000**2:
-                step = 50
-            elif dist_sq > 1000:
-                step = 20
+            if dist_m > max_dist:
+                step = int((dist_m / 2) / self.scale)
             else:
                 step = 1
 
-            if dist_sq < min:
-                min = dist_sq
+            if dist_m < min:
+                min = dist_m
                 min_pos = (y, x)
+            elif step == 1 and i < int(dist_m / self.scale):
+                # Distance is small, but were not getting closer.
+                # We either passed it or we are behind
+                i = len(self.green_line) - int(dist_m / self.scale) - 1
+            elif step == 1:
+                # Distance is small, but were not getting closer. We passed it.
+                break
 
             i += step
 

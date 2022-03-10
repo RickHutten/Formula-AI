@@ -18,7 +18,14 @@ class Window:
         # Default window parameters
         self.window_size = np.array([1200, 900])  # (width, height)
         self.zoom = 2
+        self.zoom_target = 2
         self.camera = track.start  # (y, x)
+        self.paused = False
+        self.speeds = [0.25, 0.5, 1, 2, 4, np.inf]
+        self.speed_index = len(self.speeds) - 1
+        self.step = False
+        self.show_network = True
+        self.show_debug = True
 
         # Init pygame
         pygame.init()
@@ -38,16 +45,23 @@ class Window:
 
     def update_loop(self):
         """Continuously updates the simulation"""
+        next(self.update)  # Initiates iterator
         while self.running:
+            state = {
+                'paused': self.paused,
+                'speed': self.speeds[self.speed_index],
+                'step': self.step,
+            }
+            self.step = False  # Reset step
             try:
-                self.data = next(self.update)
+                self.data = self.update.send(state)
                 self.vehicles = self.data['vehicles']
             except StopIteration:
                 # Generator is exhausted
                 return
 
         # Save the generation to a file
-        self.update.send(True)
+        self.update.send({'save': True})
 
     def loop(self):
         """Runs the window in a loop that """
@@ -63,8 +77,22 @@ class Window:
                     self.running = False
                 # Zoom in and out
                 elif event.type == pygame.MOUSEWHEEL:
-                    self.zoom *= 1.1 ** event.y
-                    self.zoom = min(5, max(0.05, self.zoom))
+                    self.zoom_target *= 1.15 ** event.y
+                    self.zoom_target = min(5, max(0.05, self.zoom_target))
+                elif event.type == pygame.KEYUP:
+                    if event.key == pygame.K_SPACE:
+                        # Toggle pause
+                        self.paused = not self.paused
+                    if event.key == pygame.K_COMMA:  # Slow down
+                        self.speed_index = max(0, self.speed_index - 1)
+                    if event.key == pygame.K_PERIOD:  # Speed up
+                        self.speed_index = min(len(self.speeds) - 1, self.speed_index + 1)
+                    if event.key == pygame.K_SLASH:  # Perform one step
+                        self.step = True
+                    if event.key == pygame.K_n:  # Toggle network visibility
+                        self.show_network = not self.show_network
+                    if event.key == pygame.K_b:  # Toggle debug information visibility
+                        self.show_debug = not self.show_debug
                 # Pan the camera
                 elif event.type == pygame.MOUSEMOTION:
                     if event.buttons[0] == 1:
@@ -72,6 +100,9 @@ class Window:
                         new_camera[0] = max(min(self.track.image.shape[0], new_camera[0]), 0)
                         new_camera[1] = max(min(self.track.image.shape[1], new_camera[1]), 0)
                         self.set_camera(new_camera)
+
+            # Let zoom grow to zoom target
+            self.zoom = 0.5 * self.zoom + 0.5 * self.zoom_target
 
             # Update whats drawn on the screen
             self.draw()
@@ -88,6 +119,7 @@ class Window:
 
     def draw(self):
         """Draws all the elements on the screen"""
+        self.screen.fill(pygame.Color('white'))
         self.draw_track()
         self.draw_vehicles()
         self.draw_hud()
@@ -126,7 +158,6 @@ class Window:
         arr = bytearray(im.tobytes('raw', 'RGB'))
         image = pygame.image.frombuffer(arr, (cropped.shape[1], cropped.shape[0]), "RGB")
         image = pygame.transform.scale(image, (int(self.zoom * (crop_end_x - crop_start_x+1)), int(self.zoom * (crop_end_y - crop_start_y+1))))
-        self.screen.fill((0, 0, 0))
         self.screen.blit(image, (draw_pos_x, draw_pos_y))
 
     def draw_vehicles(self):
@@ -163,12 +194,16 @@ class Window:
         if len(self.vehicles) == 0:
             return
 
+        if self.show_network:
+            self.draw_network()
+        if self.show_debug:
+            self.draw_debug()
         self.draw_hud_text()
-        self.draw_network()
 
     def draw_hud_text(self):
         # Draw the hud text
-        def number_to_dingems(x: float):
+        def number_to_indicator(x: float):
+            """Outputs a number [-1, 1] as an indicator string eg. -0.50 -> '|-|-:---|' """
             str = ''
             x = np.round(x * 10)
             for i in range(-10, 11):
@@ -180,19 +215,31 @@ class Window:
                     str += '-'
             return f'|{str}|'
 
+        def list_format(l: list):
+            """Formats a list of floats"""
+            s = '['
+            for i in l:
+                s += f"{i:+.3f},"
+            return s + ']'
+
         start_y = 0
         steering_angle, gas_pedal = self.vehicles[0].network.get_output()
+        heading_diff = self.vehicles[0].get_track_car_heading_difference()
+        alive = sum([0 if v.has_crashed else 1 for v in self.vehicles])
         text_to_print = [
             f'FPS: {self.clock.get_fps():.0f}',
             f'zoom: {self.zoom:.2f}',
-            f'image size: {self.cropped_size} px',
+            f'speed: {self.speeds[self.speed_index]:.2f}',
+            # f'image size: {self.cropped_size} px',
+            f'alive cars: {alive}'
             f'',
             f'time: {self.data.get("time", 0):05.1f}',
             f'generation: {self.data.get("generation", 0):03}',
-            f'gas {gas_pedal: .2f} {number_to_dingems(gas_pedal)}',
-            f'steering {steering_angle: .2f} {number_to_dingems(steering_angle)}',
-            f'angle {-self.vehicles[0].best_angle: .2f} {number_to_dingems(-self.vehicles[0].best_angle)}',
-            f'speed {3.6 * self.vehicles[0].speed:06.2f} km/h'
+            f'gas {gas_pedal: .2f} {number_to_indicator(gas_pedal)}',
+            f'steering {steering_angle: .2f} {number_to_indicator(steering_angle)}',
+            f'speed {3.6 * self.vehicles[0].speed: 06.2f} km/h',
+            # f'heading diff {heading_diff: .2f} {number_to_indicator(heading_diff)}',
+            f'input {list_format(self.vehicles[0].network.get_input())}'
         ]
         for text in text_to_print:
             text_surface = self.text_font.render(text, True, (0, 0, 0))
@@ -203,6 +250,16 @@ class Window:
             self.screen.blit(hud_bg, (0, start_y))
             self.screen.blit(text_surface, (0, start_y))
             start_y += text_surface.get_size()[1]
+
+        bottom_text = f"[,] slow down; [.] speed up; [space] pause; [/] step; [n] network; [b] debug "
+        text_surface = self.text_font.render(bottom_text, True, (0, 0, 0))
+        hud_bg = pygame.Surface(text_surface.get_size())
+        hud_bg.set_alpha(128)
+        y = self.screen.get_height() - text_surface.get_size()[1]
+        hud_bg.fill((255, 255, 255))
+        self.screen.blit(hud_bg, (0, y))
+        self.screen.blit(text_surface, (0, y))
+
 
     def draw_network(self):
         """Draws the best network onto the screen"""
@@ -227,7 +284,12 @@ class Window:
                 #     val = (neuron.value + 1) / 2
                 #     pygame.draw.circle(surface, red.lerp(green, val), (x, y), y_spacing / 3)
 
-                val = (neuron.bias + 1) / 2
+                if i == 0:
+                    val = min(max((neuron.value + 1) / 2, 0), 1)
+                else:
+                    val = (neuron.bias + 1) / 2
+
+                assert 0 <= val <= 1, f"val not in [0, 1] but {val}"
                 pygame.draw.circle(surface, red.lerp(green, val), (x, y), y_spacing / 3)
 
                 if i + 1 == network.num_layers:
@@ -245,6 +307,36 @@ class Window:
                     pygame.draw.line(surface, red.lerp(green, val), (x, y), (x_next, y_next), line_width)
 
         self.screen.blit(surface, (self.window_size[0] - width,  0))
+
+    def draw_debug(self):
+        width, height = self.window_size
+        surface = pygame.Surface([width, height], pygame.SRCALPHA)
+
+        red = pygame.Color('red')
+        green = pygame.Color('green')
+        blue = pygame.Color('blue')
+        yellow = pygame.Color('yellow')
+
+        # Current position on green line
+        pos = self.vehicles[0].get_closest_green_line_position()
+        x, y = self.track_px_to_window_px(pos)  # (x, y)
+        pygame.draw.circle(surface, blue, (x, y), 10)
+
+        for d in [25, 50, 100, 200]:
+            pos = self.vehicles[0].get_green_line_ahead(d)
+            x, y = self.track_px_to_window_px(pos)  # (x, y)
+            pygame.draw.circle(surface, green, (x, y), 10)
+
+        for d in [-10, 10]:
+            pos = self.vehicles[0].get_green_line_ahead(d)
+            x, y = self.track_px_to_window_px(pos)  # (x, y)
+            pygame.draw.circle(surface, yellow, (x, y), 10)
+
+        # pos = self.vehicles[0].get_forward(150)
+        # x, y = self.track_px_to_window_px(pos)  # (x, y)
+        # pygame.draw.circle(surface, red, (x, y), 10)
+
+        self.screen.blit(surface, (0,  0))
 
     def track_px_to_window_px(self, coord: np.array) -> np.array:
         """

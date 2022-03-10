@@ -1,5 +1,5 @@
 from typing import List, Optional
-from random import randint, random, uniform, choices
+from random import random, uniform, choices, choice
 import json
 
 import numpy as np
@@ -16,7 +16,8 @@ class GeneticController:
         self.average_fitness = 0.0
         self.population_fitness = 0.0
         self.best_fitness = 0.0
-        self.generation_index = 0
+        self.generation_index = 1
+        self.new_best = True
 
         # Create a population
         self.layer_structure = layer_structure
@@ -36,11 +37,15 @@ class GeneticController:
         self.population_fitness = sum((entity.fitness for entity in self.population))
         self.average_fitness = self.population_fitness / len(self.population)
 
+        print(f"\tAverage fitness: {self.average_fitness}")
+        print(f"\tFitness: {[veh.fitness for veh in self.population][:3]}")
+
+        last_best = self.population[0].fitness
         self.population.sort(key=lambda x: x.fitness, reverse=True)
         self.best_fitness = self.population[0].fitness
+        self.new_best = last_best != self.best_fitness
 
-        print(f"\tAverage fitness: {self.average_fitness}")
-        print(f"\tBest fitness: {[veh.fitness for veh in self.population][:3]}")
+        print(f"\tBest fitness: {self.best_fitness}")
 
         # Save the best so far
         new_population: List[Network] = self.population[:1]
@@ -57,6 +62,11 @@ class GeneticController:
         # Babies grow old
         self.population = new_population
         self.generation_index += 1
+
+        # Sort networks
+        if self.new_best:
+            sort_matrices = self.population[0].get_sort_matrices()
+            [car.sort(sort_matrices) for car in self.population]
 
     def save(self, filename):
         """Save the population to a json file"""
@@ -124,45 +134,24 @@ class Chromosome:
 
     def __create_dna(self):
         """Create dna from network"""
-        self.dna: DNA = []
-        for i in range(self.network.num_layers):
-            layer = self.network.layers[i]
-            for j in range(layer.num_neurons):
-                neuron = layer.neurons[j]
-
-                # Add the bias to the dna
-                self.dna.append(neuron.bias)
-
-                # Add the dendrite weights
-                self.dna += neuron.dendrites
+        self.dna: DNA = self.network.get_dna()
 
     def __update_network(self):
         """Update the network weights from the dna"""
-        gene_index = 0
-        for i in range(self.network.num_layers):
-            layer = self.network.layers[i]
-            for j in range(layer.num_neurons):
-                neuron = layer.neurons[j]
-
-                # Set neuron bias
-                neuron.bias = self.dna[gene_index]
-                gene_index += 1
-
-                # Set neuron dendrites
-                neuron.dendrites = self.dna[gene_index: gene_index + neuron.num_dentrites]
-                gene_index += neuron.num_dentrites
+        self.network.set_dna(self.dna)
 
     def __cross_over(self, other: 'Chromosome') -> DNA:
         """Thing of beauty"""
-        return [i if randint(0, 1) else j for i, j in zip(self.dna, other.dna)]
+        return [choice([i, j]) for i, j in zip(self.dna, other.dna)]
 
     def mutate(self):
         """Mutates some genes and rebuilds the network"""
         for i in range(len(self.dna)):
-            if random() < self.mutation_rate:
+            r = random()
+            if r < self.mutation_rate:
                 self.dna[i] = uniform(-1.0, 1.0)
-            elif random() < 2 * self.mutation_rate:
-                self.dna[i] *= uniform(0.9, 1.1)
+            elif r < (1 + 4) * self.mutation_rate:
+                self.dna[i] *= uniform(0.8, 1.2)
                 self.dna[i] = min(max(self.dna[i], -1), 1)
         # Rebuild network
         self.__update_network()
